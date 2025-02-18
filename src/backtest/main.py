@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from ta.momentum import RSIIndicator
+from dotenv import load_dotenv
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -23,6 +24,10 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+load_dotenv()
+proxy_http = os.getenv("PROXY_HTTP")
+proxy_https = os.getenv("PROXY_HTTPS")
 
 
 # ----------------------------
@@ -71,19 +76,23 @@ class Trade:
 
 
 class MarketData:
-    """ccxt.bybitデータ取得と管理を行うクラス"""
+    """ccxt.bybitデータ取得と管理を行うクラス(プロキシサーバー通し)"""
     def __init__(self, config: BacktestConfig):
         self.config = config
         self.exchange = ccxt.bybit({
             'enableRateLimit': True,
             'options': {
                 'defaultType': 'future',
-                'adjustForTimeDifference': True
-            }
+                'adjustForTimeDifference': True,
+            },
+            'proxies': {
+                'http': proxy_http,
+                'https': proxy_https,
+            },
         })
-
+        
     def fetch_data(self) -> pd.DataFrame:
-        """指定期間のOHLCVデータ取得とRSI計算（taライブラリ利用）"""
+        """指定期間のOHLCVデータ取得とRSI計算(taライブラリ利用)"""
         logger.info(f"データ取得開始: {self.config.start_date} から {self.config.end_date}")
         
         start_timestamp = int(self.config.start_date.timestamp() * 1000)
