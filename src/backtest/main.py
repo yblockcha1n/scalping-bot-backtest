@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 import ccxt
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.dates as mdates
 import talib
 import os
 import json
@@ -21,6 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class BacktestConfig:
     symbol: str = "XRP/USDT"
@@ -31,10 +34,12 @@ class BacktestConfig:
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
     tp_percent: float = 0.3
+    sl_percent: Optional[float] = None  
     maker_fee: float = 0.0002
     taker_fee: float = 0.00055
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
+
 
 @dataclass
 class Position:
@@ -43,6 +48,8 @@ class Position:
     size: float
     entry_time: datetime
     tp_price: float
+    sl_price: Optional[float] = None
+
 
 @dataclass
 class Trade:
@@ -57,8 +64,9 @@ class Trade:
     net_pnl: float
     reason: str
 
+
 class MarketData:
-    """市場データの取得と管理を行うクラス"""
+    """ccxt.bybitデータ取得と管理を行うクラス"""
     def __init__(self, config: BacktestConfig):
         self.config = config
         self.exchange = ccxt.bybit({
@@ -70,7 +78,7 @@ class MarketData:
         })
 
     def fetch_data(self) -> pd.DataFrame:
-        """指定された期間のOHLCVデータを取得"""
+        """指定期間のOHLCVデータ取得"""
         logger.info(f"データ取得開始: {self.config.start_date} から {self.config.end_date}")
         
         start_timestamp = int(self.config.start_date.timestamp() * 1000)
@@ -113,44 +121,78 @@ class MarketData:
         
         return df
 
+
 class ScalpingStrategy:
-    """スキャトレード戦略の実装クラス"""
+    """スキャルピング戦略の実装クラス"""
     def __init__(self, config: BacktestConfig):
         self.config = config
 
     def should_open_long(self, row: pd.Series) -> bool:
-        """ロングポジションを開くべきかどうかの判断"""
+        """ロングポジションのエントリー判定"""
         return not np.isnan(row['rsi']) and row['rsi'] <= self.config.rsi_oversold
 
     def should_open_short(self, row: pd.Series) -> bool:
-        """ショートポジションを開くべきかどうかの判断"""
+        """ショートポジションのエントリー判定"""
         return not np.isnan(row['rsi']) and row['rsi'] >= self.config.rsi_overbought
 
     def should_close_position(self, position: Position, row: pd.Series) -> Tuple[bool, str]:
-        """ポジションを閉じるべきかどうかの判断"""
-        if position.direction == 'long' and row['high'] >= position.tp_price:
-            return True, 'tp'
-        elif position.direction == 'short' and row['low'] <= position.tp_price:
-            return True, 'tp'
+        """
+        TP/SLの条件をチェック
+        ※ 同一ローソク足内でTPとSLが両方触れた場合は、保守的にSLを優先する。
+        """
+        if position.direction == 'long':
+            if position.sl_price is not None and row['low'] <= position.sl_price:
+                return True, 'SL'
+            elif row['high'] >= position.tp_price:
+                return True, 'TP'
+        elif position.direction == 'short':
+            if position.sl_price is not None and row['high'] >= position.sl_price:
+                return True, 'SL'
+            elif row['low'] <= position.tp_price:
+                return True, 'TP'
         return False, ''
 
+
 class PortfolioManager:
-    """ポートフォリオ管理の実装クラス"""
+    """ポートフォリオ管理クラス(@property/setterでカプセル化)"""
     def __init__(self, config: BacktestConfig):
         self.config = config
-        self.current_balance = config.initial_balance
-        self.position: Optional[Position] = None
-        self.trades: List[Trade] = []
-        self.balance_history: List[float] = [config.initial_balance]
-        self.equity_history: List[float] = [config.initial_balance]
+        self._current_balance = config.initial_balance
+        self._position: Optional[Position] = None
+        self._trades: List[Trade] = []
+        self._balance_history: List[float] = [config.initial_balance]
+
+    @property
+    def current_balance(self) -> float:
+        return self._current_balance
+
+    @current_balance.setter
+    def current_balance(self, value: float):
+        self._current_balance = value
+
+    @property
+    def position(self) -> Optional[Position]:
+        return self._position
+
+    @position.setter
+    def position(self, pos: Optional[Position]):
+        self._position = pos
+
+    @property
+    def trades(self) -> List[Trade]:
+        return self._trades
+
+    @property
+    def balance_history(self) -> List[float]:
+        return self._balance_history
 
     def calculate_position_size(self, price: float) -> float:
-        """SIZE計算"""
-        return (self.current_balance * self.config.leverage) / price
+        """ポジサイズ計算"""
+        return (self._current_balance * self.config.leverage) / price
 
     def open_position(self, row: pd.Series, direction: str):
-        """ポジション発火"""
-        if self.position is not None:
+        """ポジ発火処理"""
+        if self._position is not None:
             return
 
         price = row['close']
@@ -158,56 +200,70 @@ class PortfolioManager:
         fee = position_size * price * self.config.taker_fee
         
         tp_price = price * (1 + self.config.tp_percent/100) if direction == 'long' \
-                  else price * (1 - self.config.tp_percent/100)
+                   else price * (1 - self.config.tp_percent/100)
         
-        self.position = Position(
+        if self.config.sl_percent is not None:
+            sl_price = price * (1 - self.config.sl_percent/100) if direction == 'long' \
+                       else price * (1 + self.config.sl_percent/100)
+        else:
+            sl_price = None
+        
+        self._position = Position(
             direction=direction,
             entry_price=price,
             size=position_size,
             entry_time=row.name,
-            tp_price=tp_price
+            tp_price=tp_price,
+            sl_price=sl_price
         )
         
-        self.current_balance -= fee
+        self._current_balance -= fee
         logger.info(f"{direction}ポジション発火: 価格 = {price}, サイズ = {position_size}, 手数料 = {fee}")
 
     def close_position(self, row: pd.Series, reason: str):
-        """ポジションクローズ"""
-        if self.position is None:
+        """ポジクローズ処理"""
+        if self._position is None:
             return
 
         exit_price = row['close']
-        pnl = (exit_price - self.position.entry_price) * self.position.size if self.position.direction == 'long' \
-              else (self.position.entry_price - exit_price) * self.position.size
+        if self._position.direction == 'long':
+            pnl = (exit_price - self._position.entry_price) * self._position.size
+        else:
+            pnl = (self._position.entry_price - exit_price) * self._position.size
         
-        fee = self.position.size * exit_price * self.config.taker_fee
+        fee = self._position.size * exit_price * self.config.taker_fee
         
         trade = Trade(
-            entry_time=self.position.entry_time,
+            entry_time=self._position.entry_time,
             exit_time=row.name,
-            direction=self.position.direction,
-            entry_price=self.position.entry_price,
+            direction=self._position.direction,
+            entry_price=self._position.entry_price,
             exit_price=exit_price,
-            size=self.position.size,
+            size=self._position.size,
             pnl=pnl,
             fee=fee,
             net_pnl=pnl - fee,
             reason=reason
         )
-        self.trades.append(trade)
+        self._trades.append(trade)
         
-        self.current_balance += pnl - fee
-        self.balance_history.append(self.current_balance)
+        self._current_balance += pnl - fee
+        self._balance_history.append(self._current_balance)
         
         logger.info(f"ポジションクローズ: {reason}, PnL = {pnl}, 手数料 = {fee}, 純利益 = {pnl - fee}")
         
-        self.position = None
+        self._position = None
+
 
 class BacktestAnalyzer:
-    """バックテスト結果の分析と可視化を行うクラス"""
-    def __init__(self, config: BacktestConfig, portfolio: PortfolioManager):
+    """
+    バックテスト結果の分析・可視化および結果保存を行うクラス
+    ※取得済みのOHLCVデータ(price_data)も利用
+    """
+    def __init__(self, config: BacktestConfig, portfolio: PortfolioManager, price_data: pd.DataFrame):
         self.config = config
         self.portfolio = portfolio
+        self.price_data = price_data
         self.results_dir = Path('export/results')
         self.results_dir.mkdir(parents=True, exist_ok=True)
         
@@ -230,127 +286,117 @@ class BacktestAnalyzer:
         
         plt.rcParams.update({
             'axes.grid': True,
-            'figure.figsize': [12, 8],
-            'figure.dpi': 100,
             'font.size': 12,
             'axes.unicode_minus': False
         })
 
-    def plot_results(self):
-        """バックテスト結果をプロット"""
-        logger.info("グラフ作成開始")
-
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
-        plt.subplots_adjust(top=0.9, hspace=0.3, wspace=0.3)
-
-        title_font = self.custom_font.copy()
-        title_font.set_size(16)
-        title_font.set_weight('bold')
-
-        label_font = self.custom_font.copy()
-        label_font.set_size(12)
+    def plot_all_results(self):
+        """全てのグラフを1枚の高解像度画像にまとめて出力"""
+        logger.info("全グラフを1枚の画像にまとめて作成開始")
+        fig = plt.figure(figsize=(20, 12), dpi=300)
+        gs = gridspec.GridSpec(2, 3, height_ratios=[1, 1.2], wspace=0.3, hspace=0.4)
         
-        fig.suptitle(f'バックテスト結果: {self.config.symbol} ({self.config.timeframe})', 
-                    y=0.95, fontproperties=title_font)
-        
-        self._plot_equity_curve(ax1, label_font)
-        self._plot_profit_distribution(ax2, label_font)
-        self._plot_direction_analysis(ax3, label_font)
-        self._plot_cumulative_profit(ax4, label_font)
-        
-        plt.savefig(self.results_dir / 'backtest_results.png', bbox_inches='tight', dpi=300)
-        plt.close()
-        
-        logger.info("グラフ作成完了")
-
-    def _plot_equity_curve(self, ax, font_prop):
-        """エクイティカーブのプロット"""
-        ax.plot(np.arange(len(self.portfolio.equity_history)), 
-                self.portfolio.equity_history, 
-                label='エクイティ', 
-                color='red')
-        ax.plot(np.arange(len(self.portfolio.balance_history)), 
-                self.portfolio.balance_history, 
-                label='残高', 
-                linestyle='--', 
-                color='blue')
-
-        ax.set_title('エクイティカーブ', fontproperties=font_prop)
-        ax.set_xlabel('取引回数', fontproperties=font_prop)
-        ax.set_ylabel('USDT', fontproperties=font_prop)
-        ax.legend(loc='upper left', prop=font_prop)
-        ax.grid(True, alpha=0.3)
-
-        ax.tick_params(labelsize=10)
-
-    def _plot_profit_distribution(self, ax, font_prop):
-        """損益分布のプロット"""
+        # --- 上段：損益分布、方向別損益、累積損益 ---
+        ax_profit = fig.add_subplot(gs[0, 0])
         profits = [trade.net_pnl for trade in self.portfolio.trades]
-        ax.hist(profits, bins=30, alpha=0.75, color='coral')
+        ax_profit.hist(profits, bins=30, alpha=0.75, color='coral')
+        ax_profit.set_title('損益分布', fontproperties=self.custom_font)
+        ax_profit.set_xlabel('損益 (USDT)', fontproperties=self.custom_font)
+        ax_profit.set_ylabel('回数', fontproperties=self.custom_font)
+        ax_profit.tick_params(labelsize=10)
         
-        ax.set_title('損益分布', fontproperties=font_prop)
-        ax.set_xlabel('損益 (USDT)', fontproperties=font_prop)
-        ax.set_ylabel('回数', fontproperties=font_prop)
-        ax.grid(True, alpha=0.3)
-        
-        ax.tick_params(labelsize=10)
-
-    def _plot_direction_analysis(self, ax, font_prop):
-        """方向別の損益分布のプロット"""
+        ax_direction = fig.add_subplot(gs[0, 1])
         long_pnl = [t.net_pnl for t in self.portfolio.trades if t.direction == 'long']
         short_pnl = [t.net_pnl for t in self.portfolio.trades if t.direction == 'short']
-        
-        colors = {
-            'boxes': 'lightblue',
-            'whiskers': 'black',
-            'medians': 'red',
-            'caps': 'black'
-        }
-        
-        bp = ax.boxplot([long_pnl, short_pnl],
-                       labels=['ロング', 'ショート'],
-                       patch_artist=True)
-        
-        for element, color in colors.items():
+        bp = ax_direction.boxplot([long_pnl, short_pnl],
+                                  labels=['ロング', 'ショート'],
+                                  patch_artist=True)
+        for element, color in {'boxes': 'lightblue', 'whiskers': 'black', 'medians': 'red', 'caps': 'black'}.items():
             plt.setp(bp[element], color=color)
         plt.setp(bp['boxes'], facecolor='lightblue', alpha=0.6)
+        ax_direction.set_title('方向別の損益分布', fontproperties=self.custom_font)
+        ax_direction.set_ylabel('損益 (USDT)', fontproperties=self.custom_font)
+        ax_direction.tick_params(labelsize=10)
         
-        ax.set_title('方向別の損益分布', fontproperties=font_prop)
-        ax.set_ylabel('損益 (USDT)', fontproperties=font_prop)
-        ax.grid(True, alpha=0.3)
-        
-        for label in ax.get_xticklabels():
-            label.set_fontproperties(font_prop)
-        ax.tick_params(labelsize=10)
-
-    def _plot_cumulative_profit(self, ax, font_prop):
-        """累積損益のプロット"""
+        ax_cumprofit = fig.add_subplot(gs[0, 2])
         cumulative_pnl = np.cumsum([t.net_pnl for t in self.portfolio.trades])
-        ax.plot(cumulative_pnl, color='red', linewidth=2)
+        ax_cumprofit.plot(cumulative_pnl, color='red', linewidth=2)
+        ax_cumprofit.set_title('累積損益', fontproperties=self.custom_font)
+        ax_cumprofit.set_xlabel('取引回数', fontproperties=self.custom_font)
+        ax_cumprofit.set_ylabel('累積損益 (USDT)', fontproperties=self.custom_font)
+        ax_cumprofit.axhline(y=0, color='black', linestyle='-', alpha=0.2)
+        ax_cumprofit.tick_params(labelsize=10)
+        ax_cumprofit.fill_between(range(len(cumulative_pnl)),
+                                  cumulative_pnl,
+                                  0,
+                                  where=(cumulative_pnl >= 0),
+                                  color='lightgreen', alpha=0.3)
+        ax_cumprofit.fill_between(range(len(cumulative_pnl)),
+                                  cumulative_pnl,
+                                  0,
+                                  where=(cumulative_pnl < 0),
+                                  color='lightcoral', alpha=0.3)
         
-        ax.set_title('累積損益', fontproperties=font_prop)
-        ax.set_xlabel('取引回数', fontproperties=font_prop)
-        ax.set_ylabel('累積損益 (USDT)', fontproperties=font_prop)
-        ax.grid(True, alpha=0.3)
+        # --- 下段：XRP/USDTチャートと残高推移 ---
+        # 下段全体を1つの領域として取得し、そこから2列のサブグリッドを作成
+        gs_bottom = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[1, :], wspace=0.3)
         
-        ax.axhline(y=0, color='black', linestyle='-', alpha=0.2)
-        ax.tick_params(labelsize=10)
+        ax_price = fig.add_subplot(gs_bottom[0])
+        ax_price.plot(self.price_data.index, self.price_data['close'], label="終値", color='blue')
+        ax_price.set_title('XRP/USDT 価格チャート', fontproperties=self.custom_font)
+        ax_price.set_xlabel('日時', fontproperties=self.custom_font)
+        ax_price.set_ylabel('価格 (USDT)', fontproperties=self.custom_font)
+        ax_price.grid(True)
+        locator = mdates.DayLocator(interval=3)
+        formatter = mdates.DateFormatter('%Y-%m-%d')
+        ax_price.xaxis.set_major_locator(locator)
+        ax_price.xaxis.set_major_formatter(formatter)
+        plt.setp(ax_price.get_xticklabels(), rotation=45, ha="right", fontsize=10)
+        ax_price.legend(prop=self.custom_font)
+        
+        ax_balance = fig.add_subplot(gs_bottom[1])
+        ax_balance.plot(range(len(self.portfolio.balance_history)),
+                        self.portfolio.balance_history,
+                        marker='o', linestyle='-', color='green')
+        ax_balance.set_title('残高推移', fontproperties=self.custom_font)
+        ax_balance.set_xlabel('取引回数', fontproperties=self.custom_font)
+        ax_balance.set_ylabel('残高 (USDT)', fontproperties=self.custom_font)
+        ax_balance.grid(True)
+        
+        fig.suptitle(f'バックテスト結果：{self.config.symbol} ({self.config.timeframe})', fontsize=20, fontproperties=self.custom_font, y=0.98)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        output_path = self.results_dir / 'all_results.png'
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"全グラフ画像保存完了: {output_path}")
 
-        ax.fill_between(range(len(cumulative_pnl)), 
-                       cumulative_pnl, 
-                       0, 
-                       where=(cumulative_pnl >= 0), 
-                       color='lightgreen', 
-                       alpha=0.3)
-        ax.fill_between(range(len(cumulative_pnl)), 
-                       cumulative_pnl, 
-                       0, 
-                       where=(cumulative_pnl < 0), 
-                       color='lightcoral', 
-                       alpha=0.3)
+    def _save_trade_history(self):
+        """トレード履歴のCSV保存"""
+        trades_df = pd.DataFrame([
+            {
+                'entry_time': t.entry_time,
+                'exit_time': t.exit_time,
+                'direction': t.direction,
+                'entry_price': t.entry_price,
+                'exit_price': t.exit_price,
+                'size': t.size,
+                'pnl': t.pnl,
+                'fee': t.fee,
+                'net_pnl': t.net_pnl,
+                'reason': t.reason
+            }
+            for t in self.portfolio.trades
+        ])
+        trades_df.to_csv(self.results_dir / 'trades.csv', index=False)
+
+    def _save_statistics(self):
+        """統計情報のJSON保存"""
+        stats = self.calculate_statistics()
+        with open(self.results_dir / 'statistics.json', 'w', encoding='utf-8') as f:
+            json.dump(stats, f, indent=4, ensure_ascii=False)
 
     def calculate_statistics(self) -> Dict:
-        """統計情報を計算"""
+        """統計情報の計算"""
         if not self.portfolio.trades:
             return {}
         
@@ -358,8 +404,7 @@ class BacktestAnalyzer:
         winning_trades = [p for p in profits if p > 0]
         losing_trades = [p for p in profits if p <= 0]
         
-        total_return = ((self.portfolio.current_balance - self.config.initial_balance) 
-                       / self.config.initial_balance * 100)
+        total_return = ((self.portfolio.current_balance - self.config.initial_balance) / self.config.initial_balance * 100)
         win_rate = (len(winning_trades) / len(profits) * 100) if profits else 0
         
         return {
@@ -398,13 +443,13 @@ class BacktestAnalyzer:
         return sharpe
 
     def _calculate_max_drawdown(self) -> float:
-        """最大ドローダウンの計算"""
-        if not self.portfolio.equity_history:
+        """最大ドローダウンの計算(balance_historyを使用)"""
+        if not self.portfolio.balance_history:
             return 0.0
             
-        equity_array = np.array(self.portfolio.equity_history)
-        peak = np.maximum.accumulate(equity_array)
-        drawdown = (peak - equity_array) / peak * 100
+        balance_array = np.array(self.portfolio.balance_history)
+        peak = np.maximum.accumulate(balance_array)
+        drawdown = (peak - balance_array) / peak * 100
         max_drawdown = np.max(drawdown)
         
         return max_drawdown
@@ -420,41 +465,12 @@ class BacktestAnalyzer:
         return round(total_profit / total_loss, 2)
 
     def save_results(self):
-        """結果の保存"""
-        logger.info("結果の保存開始")
-        
-        # トレード履歴をCSVに保存
-        self._save_trade_history()
-        
-        # 統計情報の保存
+        """結果の保存(トレード履歴・統計情報の保存)"""
+        logger.info("結果保存開始")
+        self._save_trade_history()        
         self._save_statistics()
-        
-        logger.info("結果の保存完了")
+        logger.info("結果保存完了")
 
-    def _save_trade_history(self):
-        """トレード履歴の保存"""
-        trades_df = pd.DataFrame([
-            {
-                'entry_time': t.entry_time,
-                'exit_time': t.exit_time,
-                'direction': t.direction,
-                'entry_price': t.entry_price,
-                'exit_price': t.exit_price,
-                'size': t.size,
-                'pnl': t.pnl,
-                'fee': t.fee,
-                'net_pnl': t.net_pnl,
-                'reason': t.reason
-            }
-            for t in self.portfolio.trades
-        ])
-        trades_df.to_csv(self.results_dir / 'trades.csv', index=False)
-
-    def _save_statistics(self):
-        """統計情報の保存"""
-        stats = self.calculate_statistics()
-        with open(self.results_dir / 'statistics.json', 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=4, ensure_ascii=False)
 
 class Backtest:
     def __init__(self, config: BacktestConfig):
@@ -462,64 +478,53 @@ class Backtest:
         self.market_data = MarketData(config)
         self.strategy = ScalpingStrategy(config)
         self.portfolio = PortfolioManager(config)
-        self.analyzer = BacktestAnalyzer(config, self.portfolio)
+        self.data = None
+        self.analyzer = None
 
     def run(self) -> bool:
-        """バックテスト実行"""
+        """バックテストの実行"""
         df = self.market_data.fetch_data()
         if df.empty:
             logger.error("データを取得できませんでした。")
             return False
 
+        self.data = df
         logger.info("バックテスト開始")
         
         for i, row in df.iterrows():
-            current_equity = self.portfolio.current_balance
             if self.portfolio.position is not None:
-                unrealized_pnl = 0
-                if self.portfolio.position.direction == 'long':
-                    unrealized_pnl = (row['close'] - self.portfolio.position.entry_price) * \
-                                   self.portfolio.position.size
-                else:
-                    unrealized_pnl = (self.portfolio.position.entry_price - row['close']) * \
-                                   self.portfolio.position.size
-                current_equity += unrealized_pnl
-            self.portfolio.equity_history.append(current_equity)
-            
-            # ポジション有りの場合の確認
-            if self.portfolio.position is not None:
-                should_close, reason = self.strategy.should_close_position(
-                    self.portfolio.position, row
-                )
+                should_close, reason = self.strategy.should_close_position(self.portfolio.position, row)
                 if should_close:
                     self.portfolio.close_position(row, reason)
                     continue
             
-            # 新規ポジション確認
+            # エントリー判定
             if self.strategy.should_open_long(row):
                 self.portfolio.open_position(row, 'long')
             elif self.strategy.should_open_short(row):
                 self.portfolio.open_position(row, 'short')
 
         logger.info("バックテスト完了")
+        # Analyzerに取得済みの価格データ渡す
+        self.analyzer = BacktestAnalyzer(self.config, self.portfolio, self.data)
         return True
 
     def save_results(self):
-        """結果保存"""
-        self.analyzer.plot_results()
+        """結果の保存処理（全グラフ画像・統計情報など）"""
+        self.analyzer.plot_all_results()
         self.analyzer.save_results()
         
         stats = self.analyzer.calculate_statistics()
-        print("\nバックテスト結果サマリー:")
-        print(f"期間: {self.config.start_date.strftime('%Y-%m-%d')} から "
-              f"{self.config.end_date.strftime('%Y-%m-%d')}")
+        print("\nバックテスト結果一覧:")
+        print(f"期間: {self.config.start_date.strftime('%Y-%m-%d')} から {self.config.end_date.strftime('%Y-%m-%d')}")
         print(f"初期残高: {stats['初期残高']} USDT")
         print(f"最終残高: {stats['最終残高']} USDT")
         print(f"総リターン: {stats['総リターン (%)']}%")
         print(f"総取引回数: {stats['総取引回数']}")
         print(f"勝率: {stats['勝率 (%)']}%")
-        print(f"最大ドローダウン: {stats['最大ドローダウン (%)']}%")
-        print(f"\n詳細な結果は 'export/results/' ディレクトリに保存されました。")
+        print(f"最大DD: {stats['最大ドローダウン (%)']}%")
+        print(f"\n詳細結果は 'export/results/' ディレクトリに保存")
+
 
 def run_backtest(
     symbol: str = "XRP/USDT",
@@ -530,9 +535,10 @@ def run_backtest(
     rsi_overbought: float = 70.0,
     rsi_oversold: float = 30.0,
     tp_percent: float = 0.3,
+    # SLパラメータ。Noneの場合はSLは利用しない。
+    sl_percent: Optional[float] = None,
     days: int = 30
 ) -> None:
-    """バックテストを実行するためのヘルパー関数"""
     try:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
@@ -546,6 +552,7 @@ def run_backtest(
             rsi_overbought=rsi_overbought,
             rsi_oversold=rsi_oversold,
             tp_percent=tp_percent,
+            sl_percent=sl_percent,
             start_date=start_date,
             end_date=end_date
         )
@@ -558,16 +565,18 @@ def run_backtest(
         logger.error(f"バックテスト実行中にエラーが発生しました: {str(e)}")
         raise
 
+
 def main():
     params = {
         'symbol': "XRP/USDT",
-        'timeframe': "5m",
+        'timeframe': "1m",
         'initial_balance': 600.0,
         'leverage': 5,
         'rsi_period': 14,
-        'rsi_overbought': 70.0,
-        'rsi_oversold': 30.0,
+        'rsi_overbought': 85.0,
+        'rsi_oversold': 15.0,
         'tp_percent': 0.3,
+        'sl_percent': 3.0, #含まない場合はNoneとする
         'days': 60
     }
     
