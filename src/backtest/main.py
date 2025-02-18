@@ -1,3 +1,4 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 import ccxt
@@ -22,7 +23,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class BacktestConfig:
@@ -291,7 +291,7 @@ class BacktestAnalyzer:
         })
 
     def plot_all_results(self):
-        """全てのグラフを1枚の高解像度画像にまとめて出力"""
+        """全てのグラフを1枚の高解像度画像にまとめて出力し、画像も保存する"""
         logger.info("全グラフを1枚の画像にまとめて作成開始")
         fig = plt.figure(figsize=(20, 12), dpi=300)
         gs = gridspec.GridSpec(2, 3, height_ratios=[1, 1.2], wspace=0.3, hspace=0.4)
@@ -338,7 +338,6 @@ class BacktestAnalyzer:
                                   color='lightcoral', alpha=0.3)
         
         # --- 下段：XRP/USDTチャートと残高推移 ---
-        # 下段全体を1つの領域として取得し、そこから2列のサブグリッドを作成
         gs_bottom = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[1, :], wspace=0.3)
         
         ax_price = fig.add_subplot(gs_bottom[0])
@@ -367,7 +366,7 @@ class BacktestAnalyzer:
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         output_path = self.results_dir / 'all_results.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        plt.close()
+        plt.close(fig)
         logger.info(f"全グラフ画像保存完了: {output_path}")
 
     def _save_trade_history(self):
@@ -535,7 +534,6 @@ def run_backtest(
     rsi_overbought: float = 70.0,
     rsi_oversold: float = 30.0,
     tp_percent: float = 0.3,
-    # SLパラメータ。Noneの場合はSLは利用しない。
     sl_percent: Optional[float] = None,
     days: int = 30
 ) -> None:
@@ -566,21 +564,65 @@ def run_backtest(
         raise
 
 
-def main():
-    params = {
-        'symbol': "XRP/USDT",
-        'timeframe': "1m",
-        'initial_balance': 600.0,
-        'leverage': 5,
-        'rsi_period': 14,
-        'rsi_overbought': 85.0,
-        'rsi_oversold': 15.0,
-        'tp_percent': 0.3,
-        'sl_percent': 3.0, #含まない場合はNoneとする
-        'days': 60
-    }
-    
-    run_backtest(**params)
+# Streamlitフロントエンド
 
-if __name__ == "__main__":
-    main()
+st.title("バックテスト実行アプリ")
+st.write("以下のパラメータを設定して、バックテストを実行してください。")
+
+with st.sidebar:
+    st.header("パラメータ設定")
+    symbol = st.text_input("シンボル", "XRP/USDT")
+    timeframe = st.selectbox("時間足", ["1m", "5m", "15m", "1h", "4h", "1d"], index=1)
+    initial_balance = st.number_input("初期残高 (USDT)", min_value=1.0, value=600.0, step=1.0)
+    leverage = st.number_input("レバレッジ", min_value=1, value=5, step=1)
+    rsi_period = st.number_input("RSI期間", min_value=1, value=14, step=1)
+    rsi_overbought = st.number_input("RSI オーバーボート", value=85.0, step=1.0)
+    rsi_oversold = st.number_input("RSI オーバーソールド", value=15.0, step=1.0)
+    tp_percent = st.number_input("TP (%)", value=0.3, step=0.1)
+    sl_percent = st.number_input("SL (%)", value=3.0, step=0.1)
+    days = st.number_input("バックテスト日数", min_value=1, value=60, step=1)
+
+if st.sidebar.button("バックテスト実行"):
+    with st.spinner("バックテスト実行中..."):
+        try:
+            run_backtest(
+                symbol=symbol,
+                timeframe=timeframe,
+                initial_balance=initial_balance,
+                leverage=leverage,
+                rsi_period=rsi_period,
+                rsi_overbought=rsi_overbought,
+                rsi_oversold=rsi_oversold,
+                tp_percent=tp_percent,
+                sl_percent=sl_percent,
+                days=days
+            )
+            st.success("バックテスト完了")
+        except Exception as e:
+            st.error(f"バックテスト実行中にエラーが発生しました: {e}")
+
+    # 結果の表示
+    results_dir = Path('export/results')
+    statistics_file = results_dir / 'statistics.json'
+    if statistics_file.exists():
+        with open(statistics_file, 'r', encoding='utf-8') as f:
+            stats = json.load(f)
+        st.subheader("統計情報")
+        st.write(stats)
+    else:
+        st.error("統計情報が見つかりません。")
+    
+    trades_file = results_dir / 'trades.csv'
+    if trades_file.exists():
+        trades_df = pd.read_csv(trades_file)
+        st.subheader("トレード履歴")
+        st.dataframe(trades_df)
+    else:
+        st.error("トレード履歴が見つかりません。")
+    
+    results_image = results_dir / 'all_results.png'
+    if results_image.exists():
+        st.subheader("バックテスト結果グラフ")
+        st.image(str(results_image))
+    else:
+        st.error("バックテスト結果グラフが見つかりません。")
