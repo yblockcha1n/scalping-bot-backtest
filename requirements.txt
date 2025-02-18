@@ -10,3 +10,4 @@ requests>=2.31.0
 websockets>=11.0.3
 seaborn>=0.13.0
 streamlit>=1.42.1
+python-dotenv>=1.0.1
