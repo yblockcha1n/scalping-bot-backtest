@@ -5,7 +5,6 @@ import ccxt
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.dates as mdates
-import talib
 import os
 import json
 import logging
@@ -14,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from ta.momentum import RSIIndicator
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -23,6 +23,11 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------
+# バックテスト用の各クラス定義
+# ----------------------------
 
 @dataclass
 class BacktestConfig:
@@ -78,7 +83,7 @@ class MarketData:
         })
 
     def fetch_data(self) -> pd.DataFrame:
-        """指定期間のOHLCVデータ取得"""
+        """指定期間のOHLCVデータ取得とRSI計算（taライブラリ利用）"""
         logger.info(f"データ取得開始: {self.config.start_date} から {self.config.end_date}")
         
         start_timestamp = int(self.config.start_date.timestamp() * 1000)
@@ -117,7 +122,9 @@ class MarketData:
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
-        df['rsi'] = talib.RSI(df['close'], timeperiod=self.config.rsi_period)
+        # RSI計算：taライブラリを利用
+        rsi_indicator = RSIIndicator(close=df['close'], window=self.config.rsi_period)
+        df['rsi'] = rsi_indicator.rsi()
         
         return df
 
@@ -563,8 +570,9 @@ def run_backtest(
         logger.error(f"バックテスト実行中にエラーが発生しました: {str(e)}")
         raise
 
-
-# Streamlitフロントエンド
+# ----------------------------
+# Streamlitによるフロントエンド
+# ----------------------------
 
 st.title("バックテスト実行アプリ")
 st.write("以下のパラメータを設定して、バックテストを実行してください。")
@@ -601,7 +609,7 @@ if st.sidebar.button("バックテスト実行"):
         except Exception as e:
             st.error(f"バックテスト実行中にエラーが発生しました: {e}")
 
-    # 結果の表示
+    # 結果表示
     results_dir = Path('export/results')
     statistics_file = results_dir / 'statistics.json'
     if statistics_file.exists():
