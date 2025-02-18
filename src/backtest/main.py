@@ -34,7 +34,6 @@ class BacktestConfig:
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
     tp_percent: float = 0.3
-    # SL（ストップロス）のパラメータ（現状は未実装ですが、後から利用可能）
     sl_percent: Optional[float] = None  
     maker_fee: float = 0.0002
     taker_fee: float = 0.00055
@@ -49,8 +48,7 @@ class Position:
     size: float
     entry_time: datetime
     tp_price: float
-    # 将来的にSL価格を保持する場合はこちらを利用
-    # sl_price: Optional[float] = None
+    sl_price: Optional[float] = None
 
 
 @dataclass
@@ -139,13 +137,19 @@ class ScalpingStrategy:
 
     def should_close_position(self, position: Position, row: pd.Series) -> Tuple[bool, str]:
         """
-        TP(テイクプロフィット)条件をチェックする。
-        ※ 現状はTPのみでexit(SLは未実装)
+        TP/SLの条件をチェック
+        ※ 同一ローソク足内でTPとSLが両方触れた場合は、保守的にSLを優先する。
         """
-        if position.direction == 'long' and row['high'] >= position.tp_price:
-            return True, 'TP'
-        elif position.direction == 'short' and row['low'] <= position.tp_price:
-            return True, 'TP'
+        if position.direction == 'long':
+            if position.sl_price is not None and row['low'] <= position.sl_price:
+                return True, 'SL'
+            elif row['high'] >= position.tp_price:
+                return True, 'TP'
+        elif position.direction == 'short':
+            if position.sl_price is not None and row['high'] >= position.sl_price:
+                return True, 'SL'
+            elif row['low'] <= position.tp_price:
+                return True, 'TP'
         return False, ''
 
 
@@ -198,12 +202,19 @@ class PortfolioManager:
         tp_price = price * (1 + self.config.tp_percent/100) if direction == 'long' \
                    else price * (1 - self.config.tp_percent/100)
         
+        if self.config.sl_percent is not None:
+            sl_price = price * (1 - self.config.sl_percent/100) if direction == 'long' \
+                       else price * (1 + self.config.sl_percent/100)
+        else:
+            sl_price = None
+        
         self._position = Position(
             direction=direction,
             entry_price=price,
             size=position_size,
             entry_time=row.name,
-            tp_price=tp_price
+            tp_price=tp_price,
+            sl_price=sl_price
         )
         
         self._current_balance -= fee
@@ -247,7 +258,7 @@ class PortfolioManager:
 class BacktestAnalyzer:
     """
     バックテスト結果の分析・可視化および結果保存を行うクラス
-    ※ 取得済みのOHLCVデータ(price_data)も利用
+    ※取得済みのOHLCVデータ(price_data)も利用
     """
     def __init__(self, config: BacktestConfig, portfolio: PortfolioManager, price_data: pd.DataFrame):
         self.config = config
@@ -524,7 +535,7 @@ def run_backtest(
     rsi_overbought: float = 70.0,
     rsi_oversold: float = 30.0,
     tp_percent: float = 0.3,
-    # SLパラメータ（現状は未使用）
+    # SLパラメータ。Noneの場合はSLは利用しない。
     sl_percent: Optional[float] = None,
     days: int = 30
 ) -> None:
@@ -558,20 +569,18 @@ def run_backtest(
 def main():
     params = {
         'symbol': "XRP/USDT",
-        'timeframe': "5m",
+        'timeframe': "1m",
         'initial_balance': 600.0,
         'leverage': 5,
         'rsi_period': 14,
-        'rsi_overbought': 70.0,
-        'rsi_oversold': 30.0,
+        'rsi_overbought': 85.0,
+        'rsi_oversold': 15.0,
         'tp_percent': 0.3,
-        # SL現状未実装なため、パラメータとして渡せるようにしておく（例：1.0%）
-        'sl_percent': None,
+        'sl_percent': 3.0, #含まない場合はNoneとする
         'days': 60
     }
     
     run_backtest(**params)
-
 
 if __name__ == "__main__":
     main()
